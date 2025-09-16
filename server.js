@@ -1,19 +1,51 @@
 /**
  * Complete Twilio IVR Flow Implementation
- * 0. Mini-miranda
- * 1. English-spanish language selection
- * 2. Let user know that there are no CSR agents at the time, or that there are
- * 3. Ask for the question they want to handle
- * 4. LLM classify whether the question is account-specific or not
- *   - If it's account-specific ask for the dob, last 4 ssn digits, and zip code, and afterwards, if user's found, save the phone_number to the db.json and transfer call to +19343453827 FROM the customer's phone number
- *   - If it's not account-specific, transfer call to +19343453827 FROM the assistant's, current Twilio's, phone number (+12295446861)
+ * 0. English-spanish language selection (first step)
+ * 1. Mini-miranda (in selected language)
+ * 2. Time-based CSR availability check:
+ *    - If before 8pm EST: Skip CSR notice, go directly to question
+ *    - If after 8pm EST: Show "no agents available" message, then continue
+ * 3. Ask user to choose question type via DTMF:
+ *    - Press 1: General information (transfer with Twilio number)
+ *    - Press 2: Account-specific/Payment questions (verify identity first)
+ * 4. Route based on selection:
+ *   - If account-specific: ask for dob, last 4 ssn digits, and zip code, verify user, save phone_number to db.json, then transfer call to +19343453827 FROM the customer's phone number
+ *   - If general: transfer call to +19343453827 FROM the assistant's Twilio phone number (+12295446861)
+ * 
+ * VOICE CONFIGURATION:
+ * - Uses Google TTS with different voices for English and Spanish
+ * - English: Google.en-AU-Chirp3-HD-Aoede 
+ * - Spanish: Google.es-ES-Chirp3-HD-Aoede
+ * - Language selection plays English with English voice, Spanish with Spanish voice
+ * - All subsequent prompts use the voice matching the selected language
+ * - Voice configuration can be updated in CONFIG.VOICES section
+ * 
+ * CSR AVAILABILITY:
+ * - Automatically checks current time in EST timezone
+ * - CSR agents available: Before 8pm EST (skip notice entirely)
+ * - CSR agents unavailable: After 8pm EST (show unavailability message)
+ * - Configurable in CONFIG.CSR_HOURS section
+ * - Test availability at GET /test-csr-availability endpoint
+ * - Test flow behavior at GET /test-csr-flow endpoint
+ * 
+ * QUESTION TYPE CLASSIFICATION:
+ * - Simple DTMF-based selection (no AI/LLM needed)
+ * - Press 1: General information (direct transfer)
+ * - Press 2: Account-specific/Payment (identity verification required)
+ * - Test question type prompts at GET /test-question-flow endpoint
+ * 
+ * MAINTENANCE NOTES:
+ * - Action-based architecture: all steps handled through ACTIONS mapping
+ * - Multi-language support through MESSAGES object
+ * - Voice routing through addSayWithVoice() utility function
+ * - Easy to add new languages by updating CONFIG.VOICES and MESSAGES
+ * - Time-based logic in areCSRAgentsAvailable() function
+ * - Removed OpenAI/LLM dependency - using direct user selection instead
  */
 
 const express = require('express');
 const { twiml: { VoiceResponse } } = require('twilio');
-const axios = require('axios');
 const fs = require('fs').promises;
-const path = require('path');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -25,7 +57,21 @@ const CONFIG = {
   TWILIO_PHONE: '+12295446861',
   MAX_ATTEMPTS: 4,
   OPENAI_API_URL: 'https://api.openai.com/v1/chat/completions',
-  DB_FILE: './db.json'
+  DB_FILE: './db.json',
+  // CSR availability hours (EST)
+  CSR_HOURS: {
+    CLOSING_HOUR: 20, // 8pm EST (24-hour format)
+    TIMEZONE: 'America/New_York' // EST timezone
+  },
+  // Voice configuration based on Twilio documentation
+  LANGUAGES: {
+    en: 'en-US', // Google voice for English
+    es: 'es-ES'  // Google voice for Spanish (US)
+  },
+  VOICES: {
+    en: 'Google.en-AU-Chirp3-HD-Aoede',
+    es: 'Google.es-ES-Chirp3-HD-Aoede'
+  }
 };
 
 // Load database
@@ -37,9 +83,8 @@ const state = {};
 function getState(callSid) {
   if (!state[callSid]) {
     state[callSid] = {
-      currentStep: 'mini-miranda',
+      currentStep: 'language-selection', // Start with language selection
       language: null, // 'en' or 'es'
-      question: null,
       questionType: null, // 'account-specific' or 'general'
       last4ssn: null,
       dob: null,
@@ -47,7 +92,7 @@ function getState(callSid) {
       phoneNumber: null,
       attempts: {
         language: 0,
-        question: 0,
+        questionType: 0,
         last4ssn: 0,
         dob: 0,
         zip: 0
@@ -62,7 +107,7 @@ function tooManyAttempts(vr, step, callSid, res) {
   const s = getState(callSid);
   if (s.attempts[step] >= CONFIG.MAX_ATTEMPTS) {
     const lang = s.language || 'en';
-    vr.say(MESSAGES[lang].tooManyAttempts);
+    addSayWithVoice(vr, MESSAGES[lang].tooManyAttempts, lang);
     vr.hangup();
     res.type("text/xml").send(vr.toString());
     return true;
@@ -90,12 +135,14 @@ function isValidDOB(dob) {
 const MESSAGES = {
   en: {
     miniMiranda: "This call may be monitored or recorded for quality and training purposes.",
-    languagePrompt: "For English, press 1. Para Español, presiona 2.",
+    languagePromptEn: "For English, press 1.",
+    languagePromptEs: "Para Español, presiona 2.",
     noCSRAgents: "Please note that there are currently no customer service representatives available.",
-    questionPrompt: "Please briefly describe what you need help with after the beep, then press pound.",
+    questionTypePrompt: "For general information, press 1. For account specific questions or to make a payment, press 2.",
+    invalidQuestionType: "Invalid selection. Please try again.",
     invalidLanguage: "Invalid selection. Please try again.",
     ssn4Prompt: "Please enter the last four digits of your social security number using your phone keypad.",
-    dobPrompt: "Enter your date of birth as month month day day year year year year using your phone keypad.",
+    dobPrompt: "Enter your date of birth as month, month, day, day, year, year, year, year using your phone keypad.",
     zipPrompt: "Enter your five digit zip code using your phone keypad.",
     invalidSSN: "That was not four digits. Please try again using your keypad.",
     invalidDOB: "That date of birth was not valid. Please try again using your keypad.",
@@ -109,9 +156,11 @@ const MESSAGES = {
   },
   es: {
     miniMiranda: "Esta llamada puede ser monitoreada o grabada para propósitos de calidad y entrenamiento.",
-    languagePrompt: "For English, press 1. Para Español, presiona 2.",
+    languagePromptEn: "For English, press 1.",
+    languagePromptEs: "Para Español, presiona 2.",
     noCSRAgents: "Por favor tenga en cuenta que actualmente no hay representantes de servicio al cliente disponibles.",
-    questionPrompt: "Por favor describa brevemente en qué necesita ayuda después del tono, luego presiona numeral.",
+    questionTypePrompt: "Para información general, presiona 1. Para preguntas específicas de su cuenta o hacer un pago, presiona 2.",
+    invalidQuestionType: "Selección inválida. Por favor intente de nuevo.",
     invalidLanguage: "Selección inválida. Por favor intente de nuevo.",
     ssn4Prompt: "Por favor ingrese los últimos cuatro dígitos de su número de seguro social usando el teclado de su teléfono.",
     dobPrompt: "Ingrese su fecha de nacimiento como mes mes día día año año año año usando el teclado de su teléfono.",
@@ -128,15 +177,39 @@ const MESSAGES = {
   }
 };
 
+// Utility functions for voice-specific TwiML
+function addSayWithVoice(parent, text, simpleLanguage) {
+  const language = CONFIG.LANGUAGES[simpleLanguage];
+  const voice = CONFIG.VOICES[simpleLanguage];
+  const say = parent.say({ language, voice }, text);
+  return say;
+}
+
+function createVoiceResponse() {
+  return new VoiceResponse();
+}
+
+// Check if CSR agents are available based on current time in EST
+function areCSRAgentsAvailable() {
+  const now = new Date();
+  const estTime = new Date(now.toLocaleString("en-US", { timeZone: CONFIG.CSR_HOURS.TIMEZONE }));
+  const currentHour = estTime.getHours();
+  
+  const isAvailable = currentHour < CONFIG.CSR_HOURS.CLOSING_HOUR;
+  
+  console.log(`🕐 Current EST time: ${estTime.toLocaleString()}, Hour: ${currentHour}, CSR Available: ${isAvailable}`);
+  
+  return isAvailable;
+}
+
 // Action-based routing system
 const ACTIONS = {
   'mini-miranda': handleMiniMiranda,
   'language-selection': handleLanguageSelection,
   'process-language': processLanguageSelection,
   'csr-notice': handleCSRNotice,
-  'ask-question': handleQuestionPrompt,
-  'process-question': processQuestion,
-  'classify-question': classifyQuestion,
+  'ask-question-type': handleQuestionTypePrompt,
+  'process-question-type': processQuestionType,
   'ask-ssn': handleSSNPrompt,
   'process-ssn': processSSN,
   'ask-dob': handleDOBPrompt,
@@ -149,6 +222,14 @@ const ACTIONS = {
 
 async function savePhoneNumberToDB(phoneNumber, userRecord) {
   try {
+    console.log("💾 Attempting to save phone number:", phoneNumber);
+    console.log("👤 For user record:", JSON.stringify(userRecord, null, 2));
+    
+    if (!phoneNumber) {
+      console.error("❌ Phone number is null or undefined!");
+      return;
+    }
+    
     // Add phone number to the user record
     const updatedRecord = { ...userRecord, phoneNumber };
     
@@ -159,65 +240,20 @@ async function savePhoneNumberToDB(phoneNumber, userRecord) {
       r.zip === userRecord.zip
     );
     
+    console.log("🔍 Found record at index:", recordIndex);
+    
     if (recordIndex !== -1) {
+      console.log("📝 Updating record:", JSON.stringify(updatedRecord, null, 2));
       dummyDB[recordIndex] = updatedRecord;
       // Save to file
       await fs.writeFile(CONFIG.DB_FILE, JSON.stringify(dummyDB, null, 4));
-      console.log("📱 Phone number saved to database:", phoneNumber);
+      console.log("✅ Phone number saved to database successfully:", phoneNumber);
+    } else {
+      console.error("❌ User record not found in database");
     }
   } catch (error) {
     console.error("❌ Error saving phone number to database:", error);
   }
-}
-
-// LLM Classification function
-async function classifyQuestionWithLLM(question) {
-  // For demo purposes, using rule-based classification
-  // In production, you would call OpenAI API here
-  
-  const accountSpecificKeywords = [
-    'account', 'balance', 'payment', 'bill', 'statement', 'charge',
-    'transaction', 'refund', 'dispute', 'my', 'personal', 'private'
-  ];
-  
-  const questionLower = question.toLowerCase();
-  const isAccountSpecific = accountSpecificKeywords.some(keyword => 
-    questionLower.includes(keyword)
-  );
-  
-  return isAccountSpecific ? 'account-specific' : 'general';
-  
-  /* Uncomment for actual OpenAI integration:
-  try {
-    const response = await axios.post(CONFIG.OPENAI_API_URL, {
-      model: "gpt-3.5-turbo",
-      messages: [
-        {
-          role: "system",
-          content: "You are a customer service classifier. Respond with ONLY 'account-specific' or 'general'. Account-specific questions require personal information to answer (like account balances, personal details, billing issues). General questions can be answered without accessing customer records (like hours of operation, general policies, how-to questions)."
-        },
-        {
-          role: "user",
-          content: `Classify this customer question: "${question}"`
-        }
-      ],
-      max_tokens: 10,
-      temperature: 0
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    const classification = response.data.choices[0].message.content.trim().toLowerCase();
-    return classification.includes('account-specific') ? 'account-specific' : 'general';
-  } catch (error) {
-    console.error("❌ Error classifying question:", error);
-    // Fallback to rule-based classification
-    return isAccountSpecific ? 'account-specific' : 'general';
-  }
-  */
 }
 
 // ===== ACTION HANDLERS =====
@@ -226,11 +262,21 @@ async function classifyQuestionWithLLM(question) {
 function handleMiniMiranda(req, res) {
   const callSid = req.body.CallSid;
   const s = getState(callSid);
-  console.log("📢 Mini-miranda for CallSid:", callSid);
+  const lang = s.language || 'en'; // Use selected language
+  console.log("📢 Mini-miranda for CallSid:", callSid, "Language:", lang);
   
   const vr = new VoiceResponse();
-  vr.say(MESSAGES.en.miniMiranda); // Always start in English
-  s.currentStep = 'language-selection';
+  addSayWithVoice(vr, MESSAGES[lang].miniMiranda, lang); // Use selected language
+  
+  // Check CSR availability and route accordingly
+  if (areCSRAgentsAvailable()) {
+    console.log("CSR agents available, skipping notice");
+    s.currentStep = 'ask-question-type'; // Skip CSR notice, go directly to question type selection
+  } else {
+    console.log("CSR agents not available, showing notice");
+    s.currentStep = 'csr-notice'; // Show unavailability notice
+  }
+  
   vr.redirect('/action');
   res.type('text/xml').send(vr.toString());
 }
@@ -244,8 +290,15 @@ function handleLanguageSelection(req, res) {
     action: '/action?step=process-language',
     method: 'POST'
   });
-  g.say(MESSAGES.en.languagePrompt);
-  vr.say(MESSAGES.en.noInput);
+  
+  // Play English part with English voice
+  addSayWithVoice(g, MESSAGES.en.languagePromptEn, 'en');
+  
+  // Play Spanish part with Spanish voice
+  addSayWithVoice(g, MESSAGES.es.languagePromptEs, 'es');
+  
+  // Use English voice for fallback
+  addSayWithVoice(vr, MESSAGES.en.noInput, 'en');
   vr.redirect('/action?step=language-selection');
   res.type('text/xml').send(vr.toString());
 }
@@ -260,105 +313,98 @@ function processLanguageSelection(req, res) {
   
   if (digit === '1') {
     s.language = 'en';
-    s.currentStep = 'csr-notice';
+    s.currentStep = 'mini-miranda';  // Go to mini-miranda after language selection
     vr.redirect('/action');
   } else if (digit === '2') {
     s.language = 'es';
-    s.currentStep = 'csr-notice';
+    s.currentStep = 'mini-miranda';  // Go to mini-miranda after language selection
     vr.redirect('/action');
   } else {
     s.attempts.language++;
     if (tooManyAttempts(vr, 'language', callSid, res)) return;
-    vr.say(MESSAGES.en.invalidLanguage);
+    addSayWithVoice(vr, MESSAGES.en.invalidLanguage, 'en');
     vr.redirect('/action?step=language-selection');
   }
   
   res.type('text/xml').send(vr.toString());
 }
 
-// 2. CSR notice handler
+// 2. CSR notice handler (only called when agents are not available)
 function handleCSRNotice(req, res) {
   const callSid = req.body.CallSid;
   const s = getState(callSid);
   const lang = s.language || 'en';
-  console.log("👥 CSR notice for CallSid:", callSid, "Language:", lang);
+  console.log("👥 CSR unavailable notice for CallSid:", callSid, "Language:", lang);
   
   const vr = new VoiceResponse();
-  vr.say(MESSAGES[lang].noCSRAgents);
-  s.currentStep = 'ask-question';
+  
+  // Double-check availability (should be false if we got here)
+  if (!areCSRAgentsAvailable()) {
+    addSayWithVoice(vr, MESSAGES[lang].noCSRAgents, lang);
+    console.log("📢 Played CSR unavailable message");
+  } else {
+    console.log("⚠️ Warning: CSR notice called but agents are available");
+  }
+  
+  s.currentStep = 'ask-question-type';
   vr.redirect('/action');
   res.type('text/xml').send(vr.toString());
 }
 
-// 3. Question prompt handler
-function handleQuestionPrompt(req, res) {
+// 3. Question type prompt handler
+function handleQuestionTypePrompt(req, res) {
   const callSid = req.body.CallSid;
   const s = getState(callSid);
   const lang = s.language || 'en';
+  console.log("❓ Question type prompt for CallSid:", callSid, "Language:", lang);
   
   const vr = new VoiceResponse();
   const g = vr.gather({
-    input: 'speech',
-    speechTimeout: 'auto',
-    action: '/action?step=process-question',
+    input: 'dtmf',
+    numDigits: 1,
+    action: '/action?step=process-question-type',
     method: 'POST'
   });
-  g.say(MESSAGES[lang].questionPrompt);
-  vr.say(MESSAGES[lang].noInput);
-  vr.redirect('/action?step=ask-question');
+  addSayWithVoice(g, MESSAGES[lang].questionTypePrompt, lang);
+  addSayWithVoice(vr, MESSAGES[lang].noInput, lang);
+  vr.redirect('/action?step=ask-question-type');
   res.type('text/xml').send(vr.toString());
 }
 
-function processQuestion(req, res) {
+function processQuestionType(req, res) {
   const callSid = req.body.CallSid;
-  const question = req.body.SpeechResult || '';
+  const digit = req.body.Digits;
   const s = getState(callSid);
   const lang = s.language || 'en';
-  console.log("❓ Question received for CallSid:", callSid, "Question:", question);
+  console.log("🔢 Question type selection for CallSid:", callSid, "Digit:", digit);
   
-  if (!question.trim()) {
-    s.attempts.question++;
-    const vr = new VoiceResponse();
-    if (tooManyAttempts(vr, 'question', callSid, res)) return;
-    vr.say(MESSAGES[lang].noInput);
-    vr.redirect('/action?step=ask-question');
-    return res.type('text/xml').send(vr.toString());
-  }
-  
-  s.question = question;
-  s.currentStep = 'classify-question';
   const vr = new VoiceResponse();
-  vr.redirect('/action');
-  res.type('text/xml').send(vr.toString());
-}
-
-// 4. Question classification
-async function classifyQuestion(req, res) {
-  const callSid = req.body.CallSid;
-  const s = getState(callSid);
-  console.log("🤖 Classifying question for CallSid:", callSid);
   
-  try {
-    s.questionType = await classifyQuestionWithLLM(s.question);
-    console.log("📊 Question classified as:", s.questionType);
-    
-    const vr = new VoiceResponse();
-    if (s.questionType === 'account-specific') {
-      s.currentStep = 'ask-ssn';
-      // Store phone number for later saving to DB
-      s.phoneNumber = req.body.From;
-    } else {
-      s.currentStep = 'transfer-call';
-    }
+  if (digit === '1') {
+    // General information
+    s.questionType = 'general';
+    console.log("📋 Selected: General information");
+    s.currentStep = 'transfer-call';
     vr.redirect('/action');
-    res.type('text/xml').send(vr.toString());
-  } catch (error) {
-    console.error("❌ Error classifying question:", error);
-    const vr = new VoiceResponse();
-    vr.say(MESSAGES[s.language || 'en'].systemError);
-    vr.hangup();
-    res.type('text/xml').send(vr.toString());
+  } else if (digit === '2') {
+    // Account-specific or payment
+    s.questionType = 'account-specific';
+    console.log("🏦 Selected: Account-specific/Payment");
+    s.currentStep = 'ask-ssn';
+    // Store phone number for later saving to DB
+    const callerPhone = req.body.From;
+    s.phoneNumber = callerPhone;
+    console.log("📞 Capturing phone number for account verification:", callerPhone);
+    console.log("💾 Phone number stored in state:", s.phoneNumber);
+    vr.redirect('/action');
+  } else {
+    s.attempts.questionType++;
+    if (tooManyAttempts(vr, 'questionType', callSid, res)) return;
+    addSayWithVoice(vr, MESSAGES[lang].invalidQuestionType, lang);
+    vr.redirect('/action?step=ask-question-type');
   }
+  
+  res.type('text/xml').send(vr.toString());
 }
 
 // SSN, DOB, ZIP handlers (account-specific path)
@@ -374,8 +420,8 @@ function handleSSNPrompt(req, res) {
     action: '/action?step=process-ssn',
     method: 'POST'
   });
-  g.say(MESSAGES[lang].ssn4Prompt);
-  vr.say(MESSAGES[lang].noInput);
+  addSayWithVoice(g, MESSAGES[lang].ssn4Prompt, lang);
+  addSayWithVoice(vr, MESSAGES[lang].noInput, lang);
   vr.redirect('/action?step=ask-ssn');
   res.type('text/xml').send(vr.toString());
 }
@@ -388,15 +434,15 @@ function processSSN(req, res) {
   console.log("🔢 Processing SSN for CallSid:", callSid, "Value:", last4ssn);
   
   const vr = new VoiceResponse();
-  
+
   if (!last4ssn || last4ssn.length !== 4) {
     s.attempts.last4ssn++;
     if (tooManyAttempts(vr, 'last4ssn', callSid, res)) return;
-    vr.say(MESSAGES[lang].invalidSSN);
+    addSayWithVoice(vr, MESSAGES[lang].invalidSSN, lang);
     vr.redirect('/action?step=ask-ssn');
     return res.type('text/xml').send(vr.toString());
   }
-  
+
   s.last4ssn = last4ssn;
   s.currentStep = 'ask-dob';
   vr.redirect('/action');
@@ -415,8 +461,8 @@ function handleDOBPrompt(req, res) {
     action: '/action?step=process-dob',
     method: 'POST'
   });
-  g.say(MESSAGES[lang].dobPrompt);
-  vr.say(MESSAGES[lang].noInput);
+  addSayWithVoice(g, MESSAGES[lang].dobPrompt, lang);
+  addSayWithVoice(vr, MESSAGES[lang].noInput, lang);
   vr.redirect('/action?step=ask-dob');
   res.type('text/xml').send(vr.toString());
 }
@@ -429,15 +475,15 @@ function processDOB(req, res) {
   console.log("📅 Processing DOB for CallSid:", callSid, "Value:", dob);
   
   const vr = new VoiceResponse();
-  
+
   if (!dob || !isValidDOB(dob)) {
     s.attempts.dob++;
     if (tooManyAttempts(vr, 'dob', callSid, res)) return;
-    vr.say(MESSAGES[lang].invalidDOB);
+    addSayWithVoice(vr, MESSAGES[lang].invalidDOB, lang);
     vr.redirect('/action?step=ask-dob');
     return res.type('text/xml').send(vr.toString());
   }
-  
+
   s.dob = dob;
   s.currentStep = 'ask-zip';
   vr.redirect('/action');
@@ -456,8 +502,8 @@ function handleZIPPrompt(req, res) {
     action: '/action?step=process-zip',
     method: 'POST'
   });
-  g.say(MESSAGES[lang].zipPrompt);
-  vr.say(MESSAGES[lang].noInput);
+  addSayWithVoice(g, MESSAGES[lang].zipPrompt, lang);
+  addSayWithVoice(vr, MESSAGES[lang].noInput, lang);
   vr.redirect('/action?step=ask-zip');
   res.type('text/xml').send(vr.toString());
 }
@@ -470,15 +516,15 @@ function processZIP(req, res) {
   console.log("📮 Processing ZIP for CallSid:", callSid, "Value:", zip);
   
   const vr = new VoiceResponse();
-  
+
   if (!zip || zip.length !== 5) {
     s.attempts.zip++;
     if (tooManyAttempts(vr, 'zip', callSid, res)) return;
-    vr.say(MESSAGES[lang].invalidZIP);
+    addSayWithVoice(vr, MESSAGES[lang].invalidZIP, lang);
     vr.redirect('/action?step=ask-zip');
     return res.type('text/xml').send(vr.toString());
   }
-  
+
   s.zip = zip;
   s.currentStep = 'verify-user';
   vr.redirect('/action');
@@ -503,15 +549,19 @@ async function verifyUser(req, res) {
     
     if (record) {
       console.log("✅ User verified:", record.name);
+      console.log("📞 Phone number from state for saving:", s.phoneNumber);
+      console.log("📋 Complete state object:", JSON.stringify(s, null, 2));
       // Save phone number to database
       await savePhoneNumberToDB(s.phoneNumber, record);
       
-      vr.say(MESSAGES[lang].verificationSuccess.replace('{name}', record.name));
+      addSayWithVoice(vr, MESSAGES[lang].verificationSuccess.replace('{name}', record.name), lang);
       s.currentStep = 'transfer-call';
+      console.log("🔄 Setting currentStep to 'transfer-call'");
+      console.log("🎯 About to redirect to /action for transfer");
       vr.redirect('/action');
     } else {
       console.log("❌ User verification failed");
-      vr.say(MESSAGES[lang].verificationFailed);
+      addSayWithVoice(vr, MESSAGES[lang].verificationFailed, lang);
       // Reset for another attempt
       s.currentStep = 'ask-ssn';
       s.attempts.last4ssn = 0;
@@ -521,10 +571,10 @@ async function verifyUser(req, res) {
     }
   } catch (error) {
     console.error("❌ Error verifying user:", error);
-    vr.say(MESSAGES[lang].systemError);
+    addSayWithVoice(vr, MESSAGES[lang].systemError, lang);
     vr.hangup();
   }
-  
+
   res.type('text/xml').send(vr.toString());
 }
 
@@ -534,22 +584,29 @@ function transferCall(req, res) {
   const s = getState(callSid);
   const lang = s.language || 'en';
   console.log("📞 Transferring call for CallSid:", callSid, "Type:", s.questionType);
+  console.log("📱 Customer phone number:", s.phoneNumber);
+  console.log("🎯 Target phone:", CONFIG.TARGET_PHONE);
+  console.log("🏢 Twilio phone:", CONFIG.TWILIO_PHONE);
   
   const vr = new VoiceResponse();
-  vr.say(MESSAGES[lang].transferring);
+  addSayWithVoice(vr, MESSAGES[lang].transferring, lang);
   
   const dial = vr.dial();
   if (s.questionType === 'account-specific' && s.phoneNumber) {
     // Transfer FROM customer's phone number for account-specific questions
     dial.number(CONFIG.TARGET_PHONE, { callerId: s.phoneNumber });
-    console.log("📱 Transferring account-specific call FROM:", s.phoneNumber);
+    console.log("📱 Transferring account-specific call TO:", CONFIG.TARGET_PHONE, "FROM:", s.phoneNumber);
   } else {
-    // Transfer FROM Twilio's phone number for general questions
+    // Transfer FROM Twilio's phone number for general questions  
     dial.number(CONFIG.TARGET_PHONE, { callerId: CONFIG.TWILIO_PHONE });
-    console.log("📱 Transferring general call FROM:", CONFIG.TWILIO_PHONE);
+    console.log("📱 Transferring general call TO:", CONFIG.TARGET_PHONE, "FROM:", CONFIG.TWILIO_PHONE);
   }
   
-  res.type('text/xml').send(vr.toString());
+  const twimlOutput = vr.toString();
+  console.log("📄 Generated TwiML for transfer:");
+  console.log(twimlOutput);
+  
+  res.type('text/xml').send(twimlOutput);
 }
 
 // ===== ROUTING =====
@@ -557,12 +614,17 @@ function transferCall(req, res) {
 // Main entry point - starts the flow
 app.post('/start', (req, res) => {
   const callSid = req.body.CallSid;
+  const callerPhone = req.body.From;
   console.log("🎯 Starting complete IVR flow for CallSid:", callSid);
+  console.log("📞 Caller phone number:", callerPhone);
+  console.log("📋 Full request body:", JSON.stringify(req.body, null, 2));
   
   // Store the caller's phone number
   const s = getState(callSid);
-  s.phoneNumber = req.body.From;
-  s.currentStep = 'mini-miranda';
+  s.phoneNumber = callerPhone;
+  s.currentStep = 'language-selection';  // Ask for language first
+  
+  console.log("💾 Stored phone number in state:", s.phoneNumber);
   
   const vr = new VoiceResponse();
   vr.redirect('/action');
@@ -577,13 +639,23 @@ app.post('/action', async (req, res) => {
   
   console.log("🎬 Action router - CallSid:", callSid, "Step:", step);
   
+  // Ensure phone number is always available as backup
+  if (!s.phoneNumber && req.body.From) {
+    console.log("🔄 Backup: Setting phone number from request body:", req.body.From);
+    s.phoneNumber = req.body.From;
+  }
+  
   const actionHandler = ACTIONS[step];
   if (actionHandler) {
+    console.log("✅ Found action handler for step:", step);
+    if (step === 'transfer-call') {
+      console.log("📞 About to execute transfer-call action");
+    }
     await actionHandler(req, res);
   } else {
     console.error("❌ Unknown action:", step);
     const vr = new VoiceResponse();
-    vr.say(MESSAGES[s.language || 'en'].systemError);
+    addSayWithVoice(vr, MESSAGES[s.language || 'en'].systemError, s.language || 'en');
     vr.hangup();
     res.type('text/xml').send(vr.toString());
   }
